@@ -1,0 +1,12 @@
+{
+  "name": "funtime-proxy",
+  "version": "1.0.0",
+  "description": "Кэширующая прослойка между FunTime API и Minecraft-модом",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
