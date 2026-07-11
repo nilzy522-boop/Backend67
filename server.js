@@ -9,40 +9,41 @@
  *
  * Запуск: node server.js   (нужен Node.js 18+, зависимостей нет)
  */
-
+​
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const querystring = require("querystring");
-
+​
 const APP_PORT = Number(process.env.PORT || 8080);
 const FUNTIME_API = "https://api.funtime.su";
 const CONFIG_PATH = path.join(__dirname, "config.json");
-
+​
 /* ===================== КОНФИГ ===================== */
-
+​
 const DEFAULT_CONFIG = {
   apiToken: "a44f618.4de5dca28833d7d90fefba654930022a", // токен FunTime API (можно сменить через админку)
   adminPassword: "Lipajopa228$", // пароль админки (можно сменить через админку)
   requestsPerMinute: 100,       // частота опроса FunTime API
   eventType: "all",             // all / system / user
+  serverType: "anarchy",        // тип серверов для servers-info / mines-info (anarchy, creative, ...)
   clientRateLimitPerMinute: 120 // лимит запросов к /api/* с одного IP в минуту (0 = без лимита)
 };
-
+​
 let config = { ...DEFAULT_CONFIG };
 try {
   config = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
 } catch (_) {
   /* config.json появится после первого сохранения в админке */
 }
-
+​
 function saveConfig() {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
-
+​
 /* ===================== КЭШ ===================== */
-
+​
 const cache = {
   servers: { data: null, updatedAt: 0 },
   mines: { data: null, updatedAt: 0 },
@@ -50,21 +51,21 @@ const cache = {
   lastError: null,
   rateLimitedUntil: 0
 };
-
+​
 /* ===================== ЗАПРОСЫ К FUNTIME ===================== */
-
+​
 async function funtimeGet(endpoint, params = {}) {
   if (!config.apiToken) throw new Error("Токен не задан (зайдите в /admin)");
   if (Date.now() < cache.rateLimitedUntil) throw new Error("Пауза после 402 (rate limit)");
-
+​
   const url = new URL(FUNTIME_API + endpoint);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-
+​
   const res = await fetch(url, {
     headers: { "Authorization-Token": config.apiToken },
     signal: AbortSignal.timeout(10_000)
   });
-
+​
   if (res.status === 401) throw new Error("401 Unauthorized — проверьте токен");
   if (res.status === 402) {
     // Лимит запросов по токену — притормозим на 10 секунд
@@ -74,22 +75,23 @@ async function funtimeGet(endpoint, params = {}) {
   if (!res.ok) throw new Error(`FunTime API: HTTP ${res.status}`);
   return res.json();
 }
-
+​
 /* ===================== ЗАДАЧИ ОПРОСА ===================== */
 // Крутим по кругу: servers -> mines -> events(чанк 1) -> events(чанк 2) -> ...
-
+​
 let eventChunks = []; // сервера, разбитые по 30 штук (лимит events-info)
 let taskQueue = ["servers", "mines"];
 let taskIndex = 0;
 let pollTimer = null;
-
+​
 function rebuildQueue() {
   taskQueue = ["servers", "mines", ...eventChunks.map((_, i) => `events:${i}`)];
 }
-
+​
 async function runTask(task) {
   if (task === "servers") {
-    const json = await funtimeGet("/servers-info");
+    // ВАЖНО: реальные методы FunTime API живут под префиксом /method/*
+    const json = await funtimeGet("/method/servers-info", { "server-type": config.serverType || "anarchy" });
     const servers = json.response || [];
     cache.servers = { data: servers, updatedAt: Date.now() };
     // Разбиваем на чанки по 30 (ограничение events-info)
@@ -99,12 +101,12 @@ async function runTask(task) {
     }
     rebuildQueue();
   } else if (task === "mines") {
-    const json = await funtimeGet("/mines-info", { "server-types": "all" });
+    const json = await funtimeGet("/method/mines-info", { "server-types": config.serverType || "anarchy" });
     cache.mines = { data: json.servers || {}, updatedAt: Date.now() };
   } else if (task.startsWith("events:")) {
     const chunk = eventChunks[Number(task.split(":")[1])];
     if (!chunk || !chunk.length) return;
-    const json = await funtimeGet("/events-info", {
+    const json = await funtimeGet("/method/events-info", {
       "event-type": config.eventType,
       "server-type": chunk.join(",")
     });
@@ -114,7 +116,7 @@ async function runTask(task) {
     cache.events.updatedAt = Date.now();
   }
 }
-
+​
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   const rpm = Math.min(Math.max(Number(config.requestsPerMinute) || 100, 1), 600);
@@ -131,11 +133,11 @@ function startPolling() {
     }
   }, interval);
 }
-
+​
 /* ===================== ЛИМИТ ЗАПРОСОВ ПО IP ===================== */
-
+​
 const ipHits = new Map(); // ip -> { count, windowStart }
-
+​
 function checkIpRateLimit(ip) {
   const limit = Number(config.clientRateLimitPerMinute) || 0;
   if (limit <= 0) return true;
@@ -148,7 +150,7 @@ function checkIpRateLimit(ip) {
   rec.count++;
   return rec.count <= limit;
 }
-
+​
 // Чистим старые записи, чтобы Map не рос бесконечно
 setInterval(() => {
   const now = Date.now();
@@ -156,9 +158,9 @@ setInterval(() => {
     if (now - rec.windowStart >= 120_000) ipHits.delete(ip);
   }
 }, 60_000).unref();
-
+​
 /* ===================== HTTP УТИЛИТЫ ===================== */
-
+​
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -167,12 +169,12 @@ function sendJson(res, status, obj) {
   });
   res.end(body);
 }
-
+​
 function sendHtml(res, status, html) {
   res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
 }
-
+​
 function readBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -190,28 +192,28 @@ function readBody(req, maxBytes = 64 * 1024) {
     req.on("error", reject);
   });
 }
-
+​
 function getClientIp(req) {
   // Если стоите за nginx/cloudflare — берём первый IP из X-Forwarded-For
   const xff = req.headers["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
   return req.socket.remoteAddress || "unknown";
 }
-
+​
 function safeEqual(a, b) {
   const ha = crypto.createHash("sha256").update(String(a)).digest();
   const hb = crypto.createHash("sha256").update(String(b)).digest();
   return crypto.timingSafeEqual(ha, hb);
 }
-
+​
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (ch) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[ch]));
 }
-
+​
 /* ===================== АДМИН-ПАНЕЛЬ ===================== */
-
+​
 function adminPage(msg = "", isError = false) {
   const tokenPlaceholder = config.apiToken
     ? "токен задан — введите новый, чтобы сменить"
@@ -236,34 +238,37 @@ ${msg ? `<div class="msg ${isError ? "err" : "ok"}">${escapeHtml(msg)}</div>` : 
 <form method="POST" action="/admin/save">
   <label>Пароль админки</label>
   <input type="password" name="password" required autocomplete="current-password">
-
+​
   <label>Токен FunTime API (заголовок Authorization-Token)</label>
   <input type="text" name="apiToken" placeholder="${escapeHtml(tokenPlaceholder)}" autocomplete="off">
-
+​
   <label>Запросов к FunTime в минуту (1–600)</label>
   <input type="number" name="requestsPerMinute" value="${config.requestsPerMinute}" min="1" max="600">
-
+​
   <label>Тип ивентов (all / system / user)</label>
   <input type="text" name="eventType" value="${escapeHtml(config.eventType)}">
-
+​
+  <label>Тип серверов (anarchy / creative / ...)</label>
+  <input type="text" name="serverType" value="${escapeHtml(config.serverType || "anarchy")}">
+​
   <label>Лимит запросов к /api/* с одного IP в минуту (0 = без лимита)</label>
   <input type="number" name="clientRateLimitPerMinute" value="${config.clientRateLimitPerMinute}" min="0" max="100000">
-
+​
   <label>Новый пароль админки (не обязательно)</label>
   <input type="password" name="newPassword" placeholder="оставьте пустым, чтобы не менять" autocomplete="new-password">
-
+​
   <button type="submit">Сохранить</button>
 </form>
 <p><a href="/api/status">Статус сервера</a></p>
 </body></html>`;
 }
-
+​
 /* ===================== РОУТИНГ ===================== */
-
+​
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const route = `${req.method} ${url.pathname}`;
-
+​
   try {
     /* ---------- API для мода ---------- */
     if (url.pathname.startsWith("/api/")) {
@@ -271,25 +276,25 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 429, { success: false, error: "Too many requests" });
       }
       // TODO: здесь позже будет проверка HWID пользователя
-
+​
       if (route === "GET /api/mines") {
         let data = cache.mines.data || {};
         const s = url.searchParams.get("server");
         if (s) data = { [s]: data[s] || [] };
         return sendJson(res, 200, { success: true, updatedAt: cache.mines.updatedAt, servers: data });
       }
-
+​
       if (route === "GET /api/events") {
         let data = cache.events.data;
         const s = url.searchParams.get("server");
         if (s) data = { [s]: data[s] || [] };
         return sendJson(res, 200, { success: true, updatedAt: cache.events.updatedAt, servers: data });
       }
-
+​
       if (route === "GET /api/servers") {
         return sendJson(res, 200, { success: true, updatedAt: cache.servers.updatedAt, servers: cache.servers.data || [] });
       }
-
+​
       if (route === "GET /api/status") {
         return sendJson(res, 200, {
           success: true,
@@ -301,15 +306,15 @@ const server = http.createServer(async (req, res) => {
           lastError: cache.lastError
         });
       }
-
+​
       return sendJson(res, 404, { success: false, error: "Not found" });
     }
-
+​
     /* ---------- Админка ---------- */
     if (route === "GET /admin") {
       return sendHtml(res, 200, adminPage());
     }
-
+​
     if (route === "POST /admin/save") {
       const body = querystring.parse(await readBody(req));
       if (!safeEqual(body.password || "", config.adminPassword)) {
@@ -322,6 +327,9 @@ const server = http.createServer(async (req, res) => {
       if (body.eventType && ["all", "system", "user"].includes(String(body.eventType).trim())) {
         config.eventType = String(body.eventType).trim();
       }
+      if (body.serverType) {
+        config.serverType = String(body.serverType).trim();
+      }
       if (body.clientRateLimitPerMinute !== undefined && body.clientRateLimitPerMinute !== "") {
         config.clientRateLimitPerMinute = Math.max(Number(body.clientRateLimitPerMinute) || 0, 0);
       }
@@ -330,20 +338,20 @@ const server = http.createServer(async (req, res) => {
       startPolling(); // перезапускаем опрос с новыми настройками
       return sendHtml(res, 200, adminPage("Сохранено ✔ Опрос перезапущен с новыми настройками."));
     }
-
+​
     if (route === "GET /") {
       res.writeHead(302, { Location: "/admin" });
       return res.end();
     }
-
+​
     return sendJson(res, 404, { success: false, error: "Not found" });
   } catch (e) {
     return sendJson(res, 500, { success: false, error: e.message });
   }
 });
-
+​
 /* ===================== СТАРТ ===================== */
-
+​
 server.listen(APP_PORT, () => {
   console.log(`FunTime Proxy запущен: http://localhost:${APP_PORT}`);
   console.log(`Админка:               http://localhost:${APP_PORT}/admin`);
@@ -352,3 +360,4 @@ server.listen(APP_PORT, () => {
   }
   startPolling();
 });
+​
